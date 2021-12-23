@@ -1,5 +1,6 @@
 package main
 
+import "C"
 import (
 	"crypto/sha1"
 	"fmt"
@@ -16,6 +17,13 @@ var (
 )
 
 const ImageDataKey = 0x10
+type VMContext struct {
+	vm  *wasmedge.VM
+	vmConf   *wasmedge.Configure
+	tfImportObj *wasmedge.ImportObject
+	tfLiteImportObj *wasmedge.ImportObject
+	imgImportObj *wasmedge.ImportObject
+}
 
 func main() {
 	// Connect to Zipper service
@@ -26,10 +34,14 @@ func main() {
 	sfn.SetObserveDataID(ImageDataKey)
 
 	// set handler
-	sfn.SetHandler(Handler)
+	err := sfn.SetHandler(Handler)
+	if err != nil {
+		log.Print("❌ Failed to set the handler: ", err)
+		os.Exit(1)
+	}
 
 	// start
-	err := sfn.Connect()
+	err = sfn.Connect()
 	if err != nil {
 		log.Print("❌ Connect to zipper failure: ", err)
 		os.Exit(1)
@@ -41,12 +53,17 @@ func main() {
 // Handler process the data in the stream
 func Handler(img []byte) (byte, []byte) {
 	// Initialize WasmEdge's VM
-	vmConf, vm := initVM()
-	defer vm.Release()
-	defer vmConf.Release()
+	vmContext, _:= initVM()
+	defer func(){
+		vmContext.imgImportObj.Release()
+		vmContext.tfImportObj.Release()
+		vmContext.tfLiteImportObj.Release()
+		vmContext.vm.Release()
+		vmContext.vmConf.Release()
+	}()
 
 	// recognize the image
-	res, err := vm.ExecuteBindgen("infer", wasmedge.Bindgen_return_array, img)
+	res, err := vmContext.vm.ExecuteBindgen("infer", wasmedge.Bindgen_return_array, img)
 	if err == nil {
 		fmt.Println("GO: Run bindgen -- infer:", string(res.([]byte)))
 	} else {
@@ -68,20 +85,27 @@ func genSha1(buf []byte) string {
 }
 
 // initVM initialize WasmEdge's VM
-func initVM() (*wasmedge.Configure, *wasmedge.VM) {
+func initVM() (*VMContext, error) {
 	wasmedge.SetLogErrorLevel()
 	/// Set Tensorflow not to print debug info
-	os.Setenv("TF_CPP_MIN_LOG_LEVEL", "3")
-	os.Setenv("TF_CPP_MIN_VLOG_LEVEL", "3")
+	err := os.Setenv("TF_CPP_MIN_LOG_LEVEL", "3")
+	if err != nil {
+		return nil,err
+	}
+	err = os.Setenv("TF_CPP_MIN_VLOG_LEVEL", "3")
+	if err != nil {
+		return nil,err
+	}
 
 	/// Create configure
-	vmConf := wasmedge.NewConfigure(wasmedge.WASI)
+	vmContext := &VMContext{}
+	vmContext.vmConf = wasmedge.NewConfigure(wasmedge.WASI)
 
 	/// Create VM with configure
-	vm := wasmedge.NewVMWithConfig(vmConf)
+	vmContext.vm = wasmedge.NewVMWithConfig(vmContext.vmConf)
 
 	/// Init WASI
-	var wasi = vm.GetImportObject(wasmedge.WASI)
+	var wasi = vmContext.vm.GetImportObject(wasmedge.WASI)
 	wasi.InitWasi(
 		os.Args[1:],     /// The args
 		os.Environ(),    /// The envs
@@ -91,15 +115,33 @@ func initVM() (*wasmedge.Configure, *wasmedge.VM) {
 	/// Register WasmEdge-tensorflow and WasmEdge-image
 	var tfobj = wasmedge.NewTensorflowImportObject()
 	var tfliteobj = wasmedge.NewTensorflowLiteImportObject()
-	vm.RegisterImport(tfobj)
-	vm.RegisterImport(tfliteobj)
+	err = vmContext.vm.RegisterImport(tfobj)
+	if err != nil {
+		return nil, err
+	}
+	err = vmContext.vm.RegisterImport(tfliteobj)
+	if err != nil {
+		return nil, err
+	}
 	var imgobj = wasmedge.NewImageImportObject()
-	vm.RegisterImport(imgobj)
+	err = vmContext.vm.RegisterImport(imgobj)
+	if err != nil {
+		return nil, err
+	}
 
 	/// Instantiate wasm
-	vm.LoadWasmFile("rust_mobilenet_food_lib_bg.so")
-	vm.Validate()
-	vm.Instantiate()
+	err = vmContext.vm.LoadWasmFile("rust_mobilenet_food_lib_bg.so")
+	if err != nil {
+		return nil, err
+	}
+	err = vmContext.vm.Validate()
+	if err != nil {
+		return nil, err
+	}
+	err = vmContext.vm.Instantiate()
+	if err != nil {
+		return nil, err
+	}
 
-	return vmConf, vm
+	return vmContext,nil
 }
